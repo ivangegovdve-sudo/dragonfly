@@ -2,9 +2,9 @@
 // See LICENSE for licensing terms.
 //
 // A minimal demo that implements SET/GET commands with Dragonfly's
-// shard-per-thread architecture: each proactor thread owns a thread-local
-// hash map, and commands are dispatched to the correct shard through a
-// per-shard fb2::FiberQueue (MPSC) using the SuspendedCommand async
+// shard-per-thread architecture: each proactor thread owns one shard (its entry in the global
+// g_shards vector, holding that shard's hash map), and commands are dispatched to the correct shard
+// through a per-shard fb2::FiberQueue (MPSC) using the SuspendedCommand async
 // mechanism. Each proactor runs a consumer fiber draining its own queue,
 // while connection fibers on any thread enqueue callbacks via Add().
 // The synchronous fallback uses FiberQueue::Await when async is not
@@ -16,6 +16,7 @@
 #include <coroutine>
 
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/inlined_vector.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "base/cycle_clock.h"
@@ -45,15 +46,29 @@ namespace facade {
 
 namespace {
 
-// Thread-local shard storage — each proactor thread has its own hash map.
-thread_local absl::flat_hash_map<string, string> shard_db;
+struct CmdContext;
 
-// One MPSC FiberQueue per shard (indexed by proactor index). Each queue is created and
-// drained by a consumer fiber running on its owning proactor thread (see RunEngine), but
-// callbacks are enqueued into it from connection fibers on any thread via Add()/Await().
-// g_shard_consumers holds the consumer fibers so they can be joined on shutdown.
-vector<unique_ptr<fb2::FiberQueue>> g_shard_queues;
-vector<fb2::Fiber> g_shard_consumers;
+// All state for one shard. g_shards[sid] is owned by shard sid: in the shared-nothing model each
+// proactor thread owns exactly one shard and initializes its own slot (see RunEngine).
+//  - `queue`/`consumer`: the MPSC FiberQueue and the fiber draining it. Both live on the owning
+//    proactor thread, but callbacks are enqueued from connection fibers on ANY thread via
+//    Add()/Await() -- which is why g_shards is global, not thread-local.
+//  - `db`: this shard's slice of the keyspace (touched only by the owning thread).
+struct Shard {
+  unique_ptr<fb2::FiberQueue> queue;
+  fb2::Fiber consumer;
+  absl::flat_hash_map<string, string> db;
+};
+
+// One entry per shard, indexed by proactor index. Resized once in RunEngine; each proactor thread
+// then initializes its own entry.
+vector<Shard> g_shards;
+
+// The shard owned by the calling proactor thread. Queue callbacks run on their shard's owning
+// thread, so inside a callback MyShard() is that shard.
+Shard& MyShard() {
+  return g_shards[fb2::ProactorBase::me()->GetPoolIndex()];
+}
 
 // Determine the owning shard for a given key.
 constexpr uint64_t kShardHashSeed = 120577240643ULL;
@@ -111,6 +126,9 @@ struct CmdContext : public facade::ParsedCommand {
 
   fb2::EmbeddedBlockingCounter blocker{0};
   optional<string> get_result;
+
+  // Set by DispatchSquashedBatch so the reply coroutine knows which reply to emit on resume.
+  bool batch_is_get = false;
 };
 
 // Custom awaiter that registers the coroutine with the connection at the exact
@@ -148,8 +166,8 @@ AsyncCmd SetAsync(CmdContext* ctx, ProactorPool* pool) {
   unsigned shard_id = KeyShard(key, pool->size());
 
   ctx->blocker.Start(1);
-  g_shard_queues[shard_id]->Add([k = std::move(key), v = std::move(value), ctx]() mutable {
-    shard_db.insert_or_assign(std::move(k), std::move(v));
+  g_shards[shard_id].queue->Add([k = std::move(key), v = std::move(value), ctx]() mutable {
+    MyShard().db.insert_or_assign(std::move(k), std::move(v));
     ctx->blocker.Dec();
   });
 
@@ -165,9 +183,9 @@ AsyncCmd GetAsync(CmdContext* ctx, ProactorPool* pool) {
   unsigned shard_id = KeyShard(key, pool->size());
 
   ctx->blocker.Start(1);
-  g_shard_queues[shard_id]->Add([k = std::move(key), ctx] {
-    auto it = shard_db.find(k);
-    if (it != shard_db.end())
+  g_shards[shard_id].queue->Add([k = std::move(key), ctx] {
+    auto it = MyShard().db.find(k);
+    if (it != MyShard().db.end())
       ctx->get_result = it->second;
     ctx->blocker.Dec();
   });
@@ -184,12 +202,65 @@ AsyncCmd GetAsync(CmdContext* ctx, ProactorPool* pool) {
   }
 }
 
+// Maximum number of commands a single destination shard may take in one squashed batch. Bounds the
+// work one shard callback does (and that shard's result residency), independent of pipeline depth.
+// The run stops at the first command whose target shard is already full.
+constexpr unsigned kMaxSquashSize = 32;
+
+// Shared state for one squashed batch. Owns the single blocker that every command in the batch
+// awaits. Kept alive by the std::shared_ptr captured in each reply coroutine frame (and in the
+// shard callbacks), so it outlives the cross-thread work and all reply resumes.
+struct BatchState {
+  fb2::EmbeddedBlockingCounter blocker{0};
+};
+
+// Awaiter variant that suspends a command on an explicit (shared) blocker rather than the
+// command's own. Like ResolveAwaiter, await_suspend registers (blocker, handle) with the
+// ParsedCommand so the connection can resume it via SendReply().
+struct BatchAwaiter {
+  CmdContext* ctx;
+  fb2::EmbeddedBlockingCounter* blocker;
+
+  bool await_ready() const noexcept {
+    return false;  // always suspend.
+  }
+
+  void await_suspend(std::coroutine_handle<> h) const noexcept {
+    // register (blocker, handle) with the command so the connection can resume it later.
+    ctx->Resolve(blocker, h);
+  }
+
+  // a hook for when the coroutine is resumed. We don't need to do anything here.
+  void await_resume() const noexcept {
+  }
+};
+
+// Reply coroutine for one batched command: the back half of SetAsync/GetAsync. The cross-thread
+// dispatch (the per-command Add) is hoisted into DispatchSquashedBatch as one Add per shard; here
+// we only register on the shared blocker, suspend, and -- once the whole batch is fulfilled and
+// the connection resumes us in parse order -- write this command's reply from its result slot.
+AsyncCmd EmitBatchedReply(CmdContext* ctx, shared_ptr<BatchState> batch) {
+  co_await BatchAwaiter{ctx, &batch->blocker};
+
+  if (ctx->batch_is_get) {
+    auto* rb = static_cast<RedisReplyBuilder*>(ctx->rb());
+    if (ctx->get_result)
+      rb->SendBulkString(*ctx->get_result);
+    else
+      rb->SendNull();
+  } else {
+    ctx->rb()->SendOk();
+  }
+}
+
 class OkService : public ServiceInterface {
  public:
   explicit OkService(ProactorPool* pool) : pool_(pool) {
   }
 
   DispatchResult DispatchCommand(ParsedArgs args, ParsedCommand* cmd, AsyncPreference mode) final;
+  uint32_t DispatchSquashedBatch(ParsedCommand* first, unsigned count,
+                                 ConnectionContext* cntx) final;
   void ConfigureHttpHandlers(util::HttpListenerBase* base, bool is_privileged) final;
 
   ConnectionContext* CreateContext(Connection* owner) final {
@@ -257,13 +328,87 @@ DispatchResult OkService::DispatchCommand([[maybe_unused]] ParsedArgs args, Pars
   return DispatchResult::OK;
 }
 
+// Coroutine batch squasher (Variant A, see docs/coroutine-batch-squasher.md).
+// Folds a leading run of single-key SET/GET commands into one batch that shares a single blocker:
+// the cross-thread cost drops from one Add + one Dec per command to one per active shard, while
+// each command keeps its own (purely thread-local) reply coroutine.
+uint32_t OkService::DispatchSquashedBatch(ParsedCommand* first, unsigned count,
+                                          [[maybe_unused]] ConnectionContext* cntx) {
+  const unsigned num_shards = pool_->size();
+
+  // Grouping scratch, private to this call. NOT thread_local/shared: pass 3 below can preempt in
+  // FiberQueue::Add() when a shard queue is full, and another connection on this IO thread may
+  // re-enter DispatchSquashedBatch while we are parked -- a shared buffer would be corrupted.
+  vector<absl::InlinedVector<CmdContext*, 4>> per_shard(num_shards);
+
+  // Pass 1: classify and group a leading run of single-key SET/GET commands by shard. Stop at the
+  // first command that can't join: a non-squashable command (wrong arity, PING, COMMAND, unknown),
+  // or one whose destination shard has already taken kMaxSquashSize commands.
+  unsigned processed = 0;
+  unsigned active = 0;
+  auto* cmd = first;
+  for (unsigned i = 0; i < count && cmd != nullptr; i++, cmd = cmd->next) {
+    if (cmd->empty())
+      break;
+    string_view name = cmd->Front();
+    bool is_get = absl::EqualsIgnoreCase(name, "GET");
+    bool is_set = absl::EqualsIgnoreCase(name, "SET");
+    if (is_get ? cmd->size() < 2 : (is_set ? cmd->size() < 3 : true))
+      break;
+
+    auto* ctx = static_cast<CmdContext*>(cmd);
+    auto& bucket = per_shard[KeyShard(ctx->at(1), num_shards)];
+    if (bucket.size() == kMaxSquashSize)  // this shard is full -> end the run here
+      break;
+    ctx->batch_is_get = is_get;
+    active += bucket.empty();  // first command for this shard -> one more active shard
+    bucket.push_back(ctx);
+    ctx->SetDeferredReply();
+    processed++;
+  }
+
+  if (processed == 0)
+    return 0;
+
+  auto batch = make_shared<BatchState>();
+  batch->blocker.Start(active);  // (A) arm before any registration or Dec can be observed
+
+  // Pass 2: register a reply coroutine per command. Each runs eagerly to its co_await, registers
+  // (shared blocker, handle) on the command, and suspends -- so all handles are in place before any
+  // shard can Dec the blocker (see docs §5a). Order doesn't matter (the connection replies in
+  // parse order), so we iterate the shard buckets directly rather than keeping a separate list.
+  for (const auto& bucket : per_shard)
+    for (auto* ctx : bucket)
+      EmitBatchedReply(ctx, batch);
+
+  // Pass 3: one cross-thread enqueue per active shard; each runs all of its ops then a single Dec.
+  for (unsigned sid = 0; sid < num_shards; sid++) {
+    if (per_shard[sid].empty())
+      continue;
+    g_shards[sid].queue->Add([batch, cmds = std::move(per_shard[sid])]() mutable {
+      for (auto* ctx : cmds) {
+        if (ctx->batch_is_get) {
+          auto it = MyShard().db.find(ctx->at(1));
+          if (it != MyShard().db.end())
+            ctx->get_result = it->second;
+        } else {
+          MyShard().db.insert_or_assign(string(ctx->at(1)), string(ctx->at(2)));
+        }
+      }
+      batch->blocker.Dec();  // (C) one Dec per shard
+    });
+  }
+
+  return processed;
+}
+
 DispatchResult OkService::HandleSetSync(ParsedCommand* cmd) {
   string_view key = cmd->at(1);
   string_view value = cmd->at(2);
   unsigned shard_id = KeyShard(key, pool_->size());
 
-  g_shard_queues[shard_id]->Await([k = string(key), v = string(value)]() mutable {
-    shard_db.insert_or_assign(std::move(k), std::move(v));
+  g_shards[shard_id].queue->Await([k = string(key), v = string(value)]() mutable {
+    MyShard().db.insert_or_assign(std::move(k), std::move(v));
   });
 
   cmd->rb()->SendOk();
@@ -274,9 +419,9 @@ DispatchResult OkService::HandleGetSync(ParsedCommand* cmd) {
   string_view key = cmd->at(1);
   unsigned shard_id = KeyShard(key, pool_->size());
 
-  optional<string> result = g_shard_queues[shard_id]->Await([key]() -> optional<string> {
-    auto it = shard_db.find(key);
-    if (it == shard_db.end())
+  optional<string> result = g_shards[shard_id].queue->Await([key]() -> optional<string> {
+    auto it = MyShard().db.find(key);
+    if (it == MyShard().db.end())
       return nullopt;
     return it->second;
   });
@@ -426,12 +571,11 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
   // producers (connection fibers) only touch the lock-free queue + EventCount.
   const unsigned num_shards = pool->size();
   const uint32_t fq_size = GetFlag(FLAGS_fq_size);
-  g_shard_queues.resize(num_shards);
-  g_shard_consumers.resize(num_shards);
+  g_shards.resize(num_shards);
   pool->AwaitFiberOnAll([fq_size](unsigned index, ProactorBase*) {
-    g_shard_queues[index] = make_unique<fb2::FiberQueue>(fq_size);
-    g_shard_consumers[index] =
-        fb2::Fiber(absl::StrCat("shard_q", index), [index] { g_shard_queues[index]->Run(); });
+    g_shards[index].queue = make_unique<fb2::FiberQueue>(fq_size);
+    g_shards[index].consumer =
+        fb2::Fiber(absl::StrCat("shard_q", index), [index] { g_shards[index].queue->Run(); });
   });
 
   acceptor->AddListener(GetFlag(FLAGS_port),
@@ -442,11 +586,10 @@ void RunEngine(ProactorPool* pool, AcceptServer* acceptor) {
 
   // Stop each consumer fiber on its owning proactor thread and join it there.
   pool->AwaitFiberOnAll([](unsigned index, ProactorBase*) {
-    g_shard_queues[index]->Shutdown();
-    g_shard_consumers[index].Join();
+    g_shards[index].queue->Shutdown();
+    g_shards[index].consumer.Join();
   });
-  g_shard_consumers.clear();
-  g_shard_queues.clear();
+  g_shards.clear();
 }
 
 }  // namespace
