@@ -1502,62 +1502,27 @@ auto Connection::ParseLoop() -> ParserStatus {
   auto parse_func =
       protocol_ == Protocol::MEMCACHE ? &Connection::ParseMCBatch : &Connection::ParseRedisBatch;
 
-#if 0
-  if (ioloop_v2_ && pipeline_squashing_v2_ && protocol_ == Protocol::REDIS) {
-    auto parse_available = [&]() {
-      while (io_buf_.InputLen() > 0) {
-        bool parsed = (this->*parse_func)(io_buf_);
-        has_parsed_command |= parsed;
-        if (!parsed)
-          return;
-      }
-    };
-
-    parse_available();
-
-    // Once a pipeline is forming (more than one command waiting), briefly yield (or sleep, if
-    // pipeline_wait_batch_usec is set) so more socket input can be parsed into the same squash
-    // batch. A lone command (dispatch_waiting_count_ == 1) skips this entirely and dispatches
-    // immediately, so request-response traffic pays no extra latency. The loop also stops as soon
-    // as a yield brings in no new commands.
-    for (unsigned i = 0; i < kV2PipelineAccumulationYields && dispatch_waiting_count_ > 1 &&
-                         !reply_builder_->GetError();
-         ++i) {
-      if (pipeline_wait_batch_usec > 0) {
-        ThisFiber::SleepFor(chrono::microseconds(pipeline_wait_batch_usec));
-      } else {
-        ThisFiber::Yield();
-      }
-
-      size_t before = dispatch_waiting_count_;
-      ReadPendingInput();
-
-      // ReadPendingInput records hard socket errors in io_ec_ (EAGAIN is not an error). Stop
-      // accumulating and let ExecuteBatch/ReplyBatch drain what we have; IoLoopV2 observes io_ec_
-      // on the next iteration and tears the connection down.
-      if (io_ec_)
-        break;
-
-      parse_available();
-
-      if (dispatch_waiting_count_ == before)
-        break;
-    }
-
-    if (!ExecuteBatch())
-      return ERROR;
-
-    if (!ReplyBatch())
-      return ERROR;
-
-    return has_parsed_command ? OK : NEED_MORE;
-  }
-#endif
-
   ParserStatus parse_status = NEED_MORE;
+
   do {
     DCHECK_GT(io_buf_.InputLen(), 0u);
     parse_status = (this->*parse_func)(io_buf_);
+
+    if (parse_status == NEED_MORE && tl_facade_stats->conn_stats.pipeline_queue_bytes < 1_MB) {
+      DCHECK_EQ(io_buf_.InputLen(), 0u);
+
+      // make an attempt
+      if (!pending_input_) {
+        // Let other fibers / callbacks run to potentially produce more input.
+        ThisFiber::SleepFor(10us);
+        // ThisFiber::Yield();
+      }
+      // We have pending input that has not yet been parsed, and we use modest amount of memory
+      // so let's skip the execution to read and parse more data that will produce a
+      // bigger pipeline to execute.
+      if (pending_input_)
+        return NEED_MORE;
+    }
 
     // Execute/reply the commands parsed so far first, so a trailing protocol error still flushes
     // earlier replies in order before we report it.
@@ -2643,7 +2608,6 @@ bool Connection::ExecuteBatch() {
   // Invariant: batched_ must be false on entry.
   // Both ReplyBatch() and ExecuteBatch() reset it via absl::Cleanup guards on all return paths.
   DCHECK(!reply_builder_->IsBatchMode());
-  DCHECK(!pending_input_);
 
   if (parsed_to_execute_ == nullptr) {
     return true;  // no errors.
@@ -2651,6 +2615,8 @@ bool Connection::ExecuteBatch() {
 
   absl::Cleanup batch_guard = [this] { reply_builder_->SetBatchMode(false); };
   auto& conn_stats = tl_facade_stats->conn_stats;
+
+  DCHECK(!pending_input_);
 
   bool is_true_pipeline = (parsed_to_execute_->next) != nullptr;
 
@@ -3175,6 +3141,8 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
           return err;
         }
         io_event_.await(should_wake);
+        if (pending_input_)
+          continue;
       }
     }
 
@@ -3216,6 +3184,7 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
     // Only parse data if we are under the memory limit (backpressure).
     // Exception: If the queue is empty, we always parse to allow admin commands
     // (like CONFIG SET) to run so they can fix the memory limits if needed.
+
     bool pre_over_limit =
         (parsed_cmd_q_len_ > 0) &&
         qbp.IsPipelineBufferOverLimit(conn_stats.pipeline_queue_bytes, parsed_cmd_q_len_);
@@ -3236,6 +3205,13 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
       // Do NOT parse - that would grow the queue further. Instead, drain already-queued
       // commands (execute + reply) to free memory, then park until pressure is relieved.
       parse_status = NEED_MORE;
+      if (io_buf_.InputLen() == 0) {
+        CHECK(!pending_input_);
+        ThisFiber::Yield();
+        if (pending_input_) {
+          continue;  // new data arrived while yielding, go back to the top to read and parse it.
+        }
+      }
 
       size_t mem_before = conn_stats.pipeline_queue_bytes;
 
@@ -3311,7 +3287,7 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
       return std::exchange(io_ec_, {});
     }
 
-    if ((parse_status != OK) && (parse_status != NEED_MORE)) {
+    if (ERROR == parse_status) {
       break;
     }
 
