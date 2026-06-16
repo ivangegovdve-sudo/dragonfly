@@ -475,18 +475,14 @@ class Connection : public util::Connection {
   // True if a thread migration was requested and is actionable now (no active subscriptions).
   bool IsReadyToMigrate() const;
 
-  // Wake conditions shared by the idle and backpressure parks in IoLoopV2: a reply is ready,
-  // control messages are queued, the socket errored, or a migration is pending.
-  bool ShouldUnpark() const;
+  // Control events that warrant leaving any park (idle or backpressure), independent of new input
+  // or pipeline memory: a reply became ready, control messages are queued, the socket errored, or
+  // a migration is pending.
+  bool HasControlEvent() const;
 
-  // Wake condition for the idle park: the shared unpark conditions plus incoming data and a
-  // head command ready to run.
+  // Wake condition for the idle park: HasControlEvent() plus incoming data and a head command
+  // ready to run.
   bool ShouldWakeIdle() const;
-
-  // IoLoopV2 idle park: when the read buffer is empty and there is nothing else to do, flush
-  // pending replies and sleep until ShouldWakeIdle(). Returns a non-empty error code if flushing
-  // failed (connection is dead).
-  std::error_code ParkIfIdle();
 
   // IoLoopV2 control path: drains dispatch_q_ up to `quota`. Returns true if the caller should
   // restart the loop (so freshly arrived socket data is read before the data path runs), false to
@@ -498,8 +494,8 @@ class Connection : public util::Connection {
   ParserStatus RunParsePath();
 
   // IoLoopV2 data path with no new input to parse: execute ready commands and send completed
-  // replies, freeing pipeline memory without growing the queue. Always returns NEED_MORE.
-  ParserStatus DrainQueuedCommands();
+  // replies, freeing pipeline memory without growing the queue.
+  void DrainQueuedCommands();
 
   // IoLoopV2 backpressure park: if still over the pipeline limit (draining may have relieved it),
   // subscribe to global memory-relief notifications, flush, and park until pressure clears.

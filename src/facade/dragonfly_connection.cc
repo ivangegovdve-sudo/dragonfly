@@ -2998,39 +2998,21 @@ bool Connection::IsReadyToMigrate() const {
   return migration_request_ && (cc_->subscriptions == 0);
 }
 
-bool Connection::ShouldUnpark() const {
-  // CanReply() catches an in-flight async command that completed while we were parked: its reply
-  // is buffered and must be flushed even though no new input arrived.
-  bool reply_ready = parsed_head_ && parsed_head_->CanReply();
-  return reply_ready || !dispatch_q_.empty() || io_ec_ || IsReadyToMigrate();
+bool Connection::HasControlEvent() const {
+  // Control events warrant leaving any park, independent of new socket input or pipeline memory:
+  // a reply became ready, control-plane messages are queued (dispatch_q_), the socket errored or
+  // closed (io_ec_), or a thread migration is pending and actionable.
+  return (parsed_head_ && parsed_head_->CanReply()) || !dispatch_q_.empty() || io_ec_ ||
+         IsReadyToMigrate();
 }
 
 bool Connection::ShouldWakeIdle() const {
   // TODO: optimize CanReply with looking up waiter key
   // io_buf_.InputLen() > 0 is still needed for multishot flow.
 
-  // On top of the shared unpark conditions, the idle park also wakes for incoming data and for a
-  // head command that is now ready to run.
-  return io_buf_.InputLen() > 0 || pending_input_ || HasCommandToExecute() || ShouldUnpark();
-}
-
-std::error_code Connection::ParkIfIdle() {
-  if (io_buf_.InputLen() != 0 || ShouldWakeIdle())
-    return {};
-
-  // Only flush and park if the fiber is truly idle. When synchronous commands (e.g. PUBLISH) are
-  // pipelined, ExecuteBatch processes one at a time and loops back here with HasCommandToExecute()
-  // == true. Skipping the flush lets the entire pipeline execute in-memory before a single sendmsg
-  // at the end.
-  phase_ = READ_SOCKET;
-
-  // Flush replies deferred by ReplyBatch before sleeping - ensures the client gets its response
-  // even when no more data arrives (single commands, end of pipeline).
-  if (auto ec = FlushReplies(); ec)
-    return ec;
-
-  io_event_.await([this] { return ShouldWakeIdle(); });
-  return {};
+  // On top of the control events, the idle park also wakes for incoming data and for a head command
+  // that is now ready to run.
+  return io_buf_.InputLen() > 0 || pending_input_ || HasCommandToExecute() || HasControlEvent();
 }
 
 bool Connection::DrainControlPath(uint32_t quota) {
@@ -3058,7 +3040,7 @@ Connection::ParserStatus Connection::RunParsePath() {
   return parse_status;
 }
 
-Connection::ParserStatus Connection::DrainQueuedCommands() {
+void Connection::DrainQueuedCommands() {
   // No new input to parse (or parsing is held off by backpressure). Drain already-queued commands
   // - execute ready ones and send completed replies - to free pipeline memory without growing the
   // queue.
@@ -3071,7 +3053,6 @@ Connection::ParserStatus Connection::DrainQueuedCommands() {
   }
 
   NotifyIfMemReleased(mem_before);
-  return NEED_MORE;
 }
 
 void Connection::ParkOnBackpressure(util::fb2::detail::Waiter* bp_waiter) {
@@ -3101,11 +3082,11 @@ void Connection::ParkOnBackpressure(util::fb2::detail::Waiter* bp_waiter) {
   // flush error: the connection is dead and the caller observes the reply-builder error.
   if (!FlushReplies()) {
     io_event_.await([this]() {
-      // Leave the backpressure wait once our own pipeline pressure clears, or on any shared unpark
-      // condition (the latter lets a terminating/migrating connection escape the park).
+      // Leave the backpressure wait once our own pipeline pressure clears, or on any control event
+      // (the latter lets a terminating/migrating connection escape the park).
       bool under_limit = !GetQueueBackpressure().IsPipelineBufferOverLimit(
           GetLocalConnStats().pipeline_queue_bytes, parsed_cmd_q_len_);
-      return under_limit || ShouldUnpark();
+      return under_limit || HasControlEvent();
     });
   }
 }
@@ -3163,8 +3144,28 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
     }
 
     // Idle park: flush and sleep when the read buffer is empty and there is nothing else to do.
-    if (auto ec = ParkIfIdle(); ec) {
-      return ec;
+    if (io_buf_.InputLen() == 0 && !ShouldWakeIdle()) {
+      // Only flush and park if the fiber is truly idle. When synchronous commands (e.g. PUBLISH)
+      // are pipelined, ExecuteBatch processes one at a time and loops back here with
+      // HasCommandToExecute() == true. Skipping the flush lets the entire pipeline execute
+      // in-memory before a single sendmsg at the end.
+      phase_ = READ_SOCKET;
+
+      // Flush replies deferred by ReplyBatch before sleeping - ensures the client gets its response
+      // even when no more data arrives (single commands, end of pipeline).
+      if (auto ec = FlushReplies(); ec) {
+        return ec;
+      }
+
+      io_event_.await([this] { return ShouldWakeIdle(); });
+    }
+
+    // If the park woke us on a recv notification (pending_input_ set) but the data is not yet in
+    // io_buf_, restart the loop so ReadPendingInput() pulls it from the socket ASAP instead of
+    // running the data path on an empty buffer. Guarded by an empty io_buf_ so we never skip
+    // processing already-buffered input (and never busy-spin when the buffer is full).
+    if (pending_input_ && io_buf_.InputLen() == 0) {
+      continue;
     }
 
     phase_ = PROCESS;
@@ -3179,13 +3180,15 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
     // Data path - three distinct states:
     if (io_buf_.InputLen() == 0) {
       // No new input to parse: drain queued commands; the idle park handles waiting next iteration.
-      parse_status = DrainQueuedCommands();
+      DrainQueuedCommands();
+      parse_status = NEED_MORE;
     } else if (IsOverPipelineLimit()) {
       // Input is waiting but we are over the pipeline memory limit: parsing would grow the queue
       // further. Drain to free memory, then park until another connection relieves the pressure.
       // (Empty queues are never over the limit, so admin commands can still parse and fix limits.)
-      parse_status = DrainQueuedCommands();
+      DrainQueuedCommands();
       ParkOnBackpressure(&backpressure_waiter);
+      parse_status = NEED_MORE;
     } else {
       // Input available and under budget: parse, execute, reply.
       parse_status = RunParsePath();
