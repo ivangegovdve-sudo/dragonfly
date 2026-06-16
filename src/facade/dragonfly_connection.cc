@@ -3058,10 +3058,10 @@ Connection::ParserStatus Connection::RunParsePath() {
   return parse_status;
 }
 
-Connection::ParserStatus Connection::RunBackpressurePath(util::fb2::detail::Waiter* bp_waiter) {
-  // Either no input (io_buf_ empty) or over memory limit. Do NOT parse - that would grow the queue
-  // further. Instead, drain already-queued commands (execute + reply) to free memory, then park
-  // until pressure is relieved.
+Connection::ParserStatus Connection::DrainQueuedCommands() {
+  // No new input to parse (or parsing is held off by backpressure). Drain already-queued commands
+  // - execute ready ones and send completed replies - to free pipeline memory without growing the
+  // queue.
   size_t mem_before = GetLocalConnStats().pipeline_queue_bytes;
 
   if (parsed_head_) {
@@ -3071,42 +3071,43 @@ Connection::ParserStatus Connection::RunBackpressurePath(util::fb2::detail::Wait
   }
 
   NotifyIfMemReleased(mem_before);
-
-  // Re-check if pipeline buffer over limit after draining - ExecuteBatch/ReplyBatch may have freed
-  // memory. If still over limit, sleep to prevent busy-spin. Connections with an empty queue (not
-  // over limit) must stay in the read loop.
-  if (IsOverPipelineLimit()) {
-    auto& conn_stats = GetLocalConnStats();
-    conn_stats.pipeline_throttle_count++;
-    LOG_EVERY_T(WARNING, 10) << "Pipeline buffer over limit (V2)."
-                             << ", Thread pipeline_queue_bytes: " << conn_stats.pipeline_queue_bytes
-                             << ", Thread pipeline_queue_entries: "
-                             << conn_stats.pipeline_queue_entries
-                             << ", Connection parsed_cmd_q_bytes_: " << parsed_cmd_q_bytes_
-                             << ", Connection parsed commands queue size: " << parsed_cmd_q_len_
-                             << ", consider increasing pipeline_buffer_limit/pipeline_queue_limit";
-
-    // Subscribe persistently to the global backpressure EventCount so that when another connection
-    // frees memory (or CONFIG SET raises limits), our waiter callback fires io_event_.notify(),
-    // waking this fiber. Must be persistent because io_event_.await()'s internal loop may re-sleep
-    // if the predicate is still false after the first notification. A one-shot subscription would
-    // be consumed on the first wake, leaving us "deaf" to future memory relief.
-    auto sub_key =
-        GetQueueBackpressure().v2_pipeline_backpressure_ec.subscribe_persistent(bp_waiter);
-
-    // Client needs replies to free its send buffer and relieve backpressure. Skip the park on a
-    // flush error: the connection is dead and the caller observes the reply-builder error.
-    if (!FlushReplies()) {
-      io_event_.await([this]() {
-        // Leave the backpressure wait once our own pipeline pressure clears, or on any shared
-        // unpark condition (the latter lets a terminating/migrating connection escape the park).
-        bool under_limit = !GetQueueBackpressure().IsPipelineBufferOverLimit(
-            GetLocalConnStats().pipeline_queue_bytes, parsed_cmd_q_len_);
-        return under_limit || ShouldUnpark();
-      });
-    }
-  }
   return NEED_MORE;
+}
+
+void Connection::ParkOnBackpressure(util::fb2::detail::Waiter* bp_waiter) {
+  // Draining (by the caller) may have freed enough memory; only park if still over the limit, to
+  // prevent a busy-spin.
+  if (!IsOverPipelineLimit())
+    return;
+
+  auto& conn_stats = GetLocalConnStats();
+  conn_stats.pipeline_throttle_count++;
+  LOG_EVERY_T(WARNING, 10) << "Pipeline buffer over limit (V2)."
+                           << ", Thread pipeline_queue_bytes: " << conn_stats.pipeline_queue_bytes
+                           << ", Thread pipeline_queue_entries: "
+                           << conn_stats.pipeline_queue_entries
+                           << ", Connection parsed_cmd_q_bytes_: " << parsed_cmd_q_bytes_
+                           << ", Connection parsed commands queue size: " << parsed_cmd_q_len_
+                           << ", consider increasing pipeline_buffer_limit/pipeline_queue_limit";
+
+  // Subscribe persistently to the global backpressure EventCount so that when another connection
+  // frees memory (or CONFIG SET raises limits), our waiter callback fires io_event_.notify(),
+  // waking this fiber. Must be persistent because io_event_.await()'s internal loop may re-sleep
+  // if the predicate is still false after the first notification. A one-shot subscription would be
+  // consumed on the first wake, leaving us "deaf" to future memory relief.
+  auto sub_key = GetQueueBackpressure().v2_pipeline_backpressure_ec.subscribe_persistent(bp_waiter);
+
+  // Client needs replies to free its send buffer and relieve backpressure. Skip the park on a
+  // flush error: the connection is dead and the caller observes the reply-builder error.
+  if (!FlushReplies()) {
+    io_event_.await([this]() {
+      // Leave the backpressure wait once our own pipeline pressure clears, or on any shared unpark
+      // condition (the latter lets a terminating/migrating connection escape the park).
+      bool under_limit = !GetQueueBackpressure().IsPipelineBufferOverLimit(
+          GetLocalConnStats().pipeline_queue_bytes, parsed_cmd_q_len_);
+      return under_limit || ShouldUnpark();
+    });
+  }
 }
 
 variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
@@ -3175,11 +3176,20 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
       continue;
     }
 
-    // Data path: parse when we have input and memory budget (admin commands always parse so they
-    // can relieve backpressure), otherwise drain queued commands and park on backpressure.
-    parse_status = (io_buf_.InputLen() > 0 && !IsOverPipelineLimit())
-                       ? RunParsePath()
-                       : RunBackpressurePath(&backpressure_waiter);
+    // Data path - three distinct states:
+    if (io_buf_.InputLen() == 0) {
+      // No new input to parse: drain queued commands; the idle park handles waiting next iteration.
+      parse_status = DrainQueuedCommands();
+    } else if (IsOverPipelineLimit()) {
+      // Input is waiting but we are over the pipeline memory limit: parsing would grow the queue
+      // further. Drain to free memory, then park until another connection relieves the pressure.
+      // (Empty queues are never over the limit, so admin commands can still parse and fix limits.)
+      parse_status = DrainQueuedCommands();
+      ParkOnBackpressure(&backpressure_waiter);
+    } else {
+      // Input available and under budget: parse, execute, reply.
+      parse_status = RunParsePath();
+    }
 
     if (reply_builder_->GetError()) {
       return reply_builder_->GetError();

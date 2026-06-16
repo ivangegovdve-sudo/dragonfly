@@ -497,10 +497,13 @@ class Connection : public util::Connection {
   // and reply. Returns the parser status.
   ParserStatus RunParsePath();
 
-  // IoLoopV2 data path when there is no parseable input or we are over the pipeline limit: drain
-  // queued commands to free memory, then park on backpressure relief if still over limit. Always
-  // returns NEED_MORE.
-  ParserStatus RunBackpressurePath(util::fb2::detail::Waiter* backpressure_waiter);
+  // IoLoopV2 data path with no new input to parse: execute ready commands and send completed
+  // replies, freeing pipeline memory without growing the queue. Always returns NEED_MORE.
+  ParserStatus DrainQueuedCommands();
+
+  // IoLoopV2 backpressure park: if still over the pipeline limit (draining may have relieved it),
+  // subscribe to global memory-relief notifications, flush, and park until pressure clears.
+  void ParkOnBackpressure(util::fb2::detail::Waiter* backpressure_waiter);
 
   // Guard of the current subscription to a parsed commands async task blocker
   struct WaitEvent {
