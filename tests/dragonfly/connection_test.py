@@ -1151,6 +1151,48 @@ async def test_squashed_pipeline_pubsub(df_server: DflyInstance):
     await writer.wait_closed()
 
 
+"""
+Regression: some commands produce no top-level reply at all (e.g. REPLCONF ACK). When such a
+command lands in a squashed pipeline it is dispatched standalone and its captured reply is empty
+(monostate). Resolving that empty deferred reply must not crash the server
+(parsed_command.cc: DCHECK pl.index() > 0).
+"""
+
+
+@dfly_args({"proactor_threads": "1", "pipeline_squash": 1})
+async def test_squashed_pipeline_no_reply(df_server: DflyInstance):
+    reader, writer = await asyncio.open_connection("localhost", df_server.port)
+
+    def enc(*args):
+        out = f"*{len(args)}\r\n".encode()
+        for a in args:
+            b = str(a).encode()
+            out += f"${len(b)}\r\n".encode() + b + b"\r\n"
+        return out
+
+    # A large pipeline forces SquashPipeline. REPLCONF ACK produces no reply and is dispatched
+    # standalone among squashable SETs. A trailing PING marker confirms the whole batch was
+    # processed without crashing.
+    req = enc("SET", "k", "v") * 40
+    req += enc("REPLCONF", "ACK", "1")
+    req += enc("SET", "k", "v") * 40
+    req += enc("PING", "squash_survived")
+    writer.write(req)
+    await writer.drain()
+
+    data = b""
+    async with async_timeout.timeout(5):
+        while b"squash_survived" not in data:
+            chunk = await reader.read(65536)
+            if not chunk:
+                break
+            data += chunk
+
+    assert b"squash_survived" in data, "server did not finish the pipeline (crash?)"
+    writer.close()
+    await writer.wait_closed()
+
+
 async def test_unix_domain_socket(df_factory, tmp_dir):
     server = df_factory.create(proactor_threads=1, port=BASE_PORT, unixsocket="./df.sock")
     server.start()
