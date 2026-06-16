@@ -479,6 +479,29 @@ class Connection : public util::Connection {
   // control messages are queued, the socket errored, or a migration is pending.
   bool ShouldUnpark() const;
 
+  // Wake condition for the idle park: the shared unpark conditions plus incoming data and a
+  // head command ready to run.
+  bool ShouldWakeIdle() const;
+
+  // IoLoopV2 idle park: when the read buffer is empty and there is nothing else to do, flush
+  // pending replies and sleep until ShouldWakeIdle(). Returns a non-empty error code if flushing
+  // failed (connection is dead).
+  std::error_code ParkIfIdle();
+
+  // IoLoopV2 control path: drains dispatch_q_ up to `quota`. Returns true if the caller should
+  // restart the loop (so freshly arrived socket data is read before the data path runs), false to
+  // fall through to the data path.
+  bool DrainControlPath(uint32_t quota);
+
+  // IoLoopV2 data path when input is available and we are under the pipeline limit: parse, execute
+  // and reply. Returns the parser status.
+  ParserStatus RunParsePath();
+
+  // IoLoopV2 data path when there is no parseable input or we are over the pipeline limit: drain
+  // queued commands to free memory, then park on backpressure relief if still over limit. Always
+  // returns NEED_MORE.
+  ParserStatus RunBackpressurePath(util::fb2::detail::Waiter* backpressure_waiter);
+
   // Guard of the current subscription to a parsed commands async task blocker
   struct WaitEvent {
     explicit WaitEvent(ParsedCommand* cmd, util::fb2::detail::Waiter* w);

@@ -3005,6 +3005,110 @@ bool Connection::ShouldUnpark() const {
   return reply_ready || !dispatch_q_.empty() || io_ec_ || IsReadyToMigrate();
 }
 
+bool Connection::ShouldWakeIdle() const {
+  // TODO: optimize CanReply with looking up waiter key
+  // io_buf_.InputLen() > 0 is still needed for multishot flow.
+
+  // On top of the shared unpark conditions, the idle park also wakes for incoming data and for a
+  // head command that is now ready to run.
+  return io_buf_.InputLen() > 0 || pending_input_ || HasCommandToExecute() || ShouldUnpark();
+}
+
+std::error_code Connection::ParkIfIdle() {
+  if (io_buf_.InputLen() != 0 || ShouldWakeIdle())
+    return {};
+
+  // Only flush and park if the fiber is truly idle. When synchronous commands (e.g. PUBLISH) are
+  // pipelined, ExecuteBatch processes one at a time and loops back here with HasCommandToExecute()
+  // == true. Skipping the flush lets the entire pipeline execute in-memory before a single sendmsg
+  // at the end.
+  phase_ = READ_SOCKET;
+
+  // Flush replies deferred by ReplyBatch before sleeping - ensures the client gets its response
+  // even when no more data arrives (single commands, end of pipeline).
+  if (auto ec = FlushReplies(); ec)
+    return ec;
+
+  io_event_.await([this] { return ShouldWakeIdle(); });
+  return {};
+}
+
+bool Connection::DrainControlPath(uint32_t quota) {
+  // Bounded quota prevents the control path from starving the data path: under a PubSub flood
+  // dispatch_q_ can accumulate thousands of messages, and without a quota the fiber would drain
+  // them all before parsing any socket data. Mirrors V1's async_dispatch_quota mechanism.
+  if (dispatch_q_.empty())
+    return false;
+
+  bool quota_reached = ProcessControlMessages(quota);
+  GetQueueBackpressure().pubsub_ec.notifyAll();
+
+  // Restart the loop unless the quota was hit. Restarting forces ReadPendingInput() to pull newly
+  // arrived TCP data (so the data path doesn't miss a parse cycle) and acts as a fast path to flush
+  // the accumulated PubSub replies via the idle-await block. Falling through only when the quota is
+  // reached guarantees a continuous flood cannot indefinitely starve pipelined commands.
+  return !quota_reached;
+}
+
+Connection::ParserStatus Connection::RunParsePath() {
+  // We have input data AND memory budget - parse new commands, execute, reply.
+  size_t mem_before = GetLocalConnStats().pipeline_queue_bytes;
+  ParserStatus parse_status = ParseLoop();
+  NotifyIfMemReleased(mem_before);
+  return parse_status;
+}
+
+Connection::ParserStatus Connection::RunBackpressurePath(util::fb2::detail::Waiter* bp_waiter) {
+  // Either no input (io_buf_ empty) or over memory limit. Do NOT parse - that would grow the queue
+  // further. Instead, drain already-queued commands (execute + reply) to free memory, then park
+  // until pressure is relieved.
+  size_t mem_before = GetLocalConnStats().pipeline_queue_bytes;
+
+  if (parsed_head_) {
+    if (HasCommandToExecute())
+      ExecuteBatch();
+    ReplyBatch();
+  }
+
+  NotifyIfMemReleased(mem_before);
+
+  // Re-check if pipeline buffer over limit after draining - ExecuteBatch/ReplyBatch may have freed
+  // memory. If still over limit, sleep to prevent busy-spin. Connections with an empty queue (not
+  // over limit) must stay in the read loop.
+  if (IsOverPipelineLimit()) {
+    auto& conn_stats = GetLocalConnStats();
+    conn_stats.pipeline_throttle_count++;
+    LOG_EVERY_T(WARNING, 10) << "Pipeline buffer over limit (V2)."
+                             << ", Thread pipeline_queue_bytes: " << conn_stats.pipeline_queue_bytes
+                             << ", Thread pipeline_queue_entries: "
+                             << conn_stats.pipeline_queue_entries
+                             << ", Connection parsed_cmd_q_bytes_: " << parsed_cmd_q_bytes_
+                             << ", Connection parsed commands queue size: " << parsed_cmd_q_len_
+                             << ", consider increasing pipeline_buffer_limit/pipeline_queue_limit";
+
+    // Subscribe persistently to the global backpressure EventCount so that when another connection
+    // frees memory (or CONFIG SET raises limits), our waiter callback fires io_event_.notify(),
+    // waking this fiber. Must be persistent because io_event_.await()'s internal loop may re-sleep
+    // if the predicate is still false after the first notification. A one-shot subscription would
+    // be consumed on the first wake, leaving us "deaf" to future memory relief.
+    auto sub_key =
+        GetQueueBackpressure().v2_pipeline_backpressure_ec.subscribe_persistent(bp_waiter);
+
+    // Client needs replies to free its send buffer and relieve backpressure. Skip the park on a
+    // flush error: the connection is dead and the caller observes the reply-builder error.
+    if (!FlushReplies()) {
+      io_event_.await([this]() {
+        // Leave the backpressure wait once our own pipeline pressure clears, or on any shared
+        // unpark condition (the latter lets a terminating/migrating connection escape the park).
+        bool under_limit = !GetQueueBackpressure().IsPipelineBufferOverLimit(
+            GetLocalConnStats().pipeline_queue_bytes, parsed_cmd_q_len_);
+        return under_limit || ShouldUnpark();
+      });
+    }
+  }
+  return NEED_MORE;
+}
+
 variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
   auto* peer = socket_.get();
   recv_buf_.res_len = 0;
@@ -3057,131 +3161,25 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
       ReadPendingInput();
     }
 
-    // await block (no data to read)
-    if (io_buf_.InputLen() == 0) {
-      auto should_wake = [this]() {
-        // TODO: optimize CanReply with looking up waiter key
-        // io_buf_.InputLen() > 0 is still needed for multishot flow.
-
-        // On top of the shared unpark conditions, the idle park also wakes for incoming data and
-        // for a head command that is now ready to run.
-        return io_buf_.InputLen() > 0 || pending_input_ || HasCommandToExecute() || ShouldUnpark();
-      };
-
-      // Only flush and park if the fiber is truly idle. When synchronous commands
-      // (e.g. PUBLISH) are pipelined, ExecuteBatch processes one at a time and loops
-      // back here with HasCommandToExecute() == true. Skipping the flush lets the
-      // entire pipeline execute in-memory before a single sendmsg at the end.
-      if (!should_wake()) {
-        phase_ = READ_SOCKET;
-
-        // Flush replies deferred by ReplyBatch before sleeping - ensures the client
-        // gets its response even when no more data arrives (single commands, end of pipeline).
-        if (auto ec = FlushReplies(); ec) {
-          return ec;
-        }
-
-        io_event_.await(should_wake);
-      }
+    // Idle park: flush and sleep when the read buffer is empty and there is nothing else to do.
+    if (auto ec = ParkIfIdle(); ec) {
+      return ec;
     }
 
     phase_ = PROCESS;
     bool reached_capacity = io_buf_.AppendLen() == 0;
 
-    // Handle dispatch queue items (Control Path) with a bounded quota to prevent
-    // starvation of the data path:
-    // - Under a PubSub flood, dispatch_q_ can accumulate thousands of messages.
-    // - Without a quota, the fiber would drain them all before parsing any new data from the
-    //   socket, starving GET/SET and other pipeline commands.
-    // - This mirrors V1's async_dispatch_quota / prefer_pipeline_execution mechanism in AsyncFiber.
-    if (!dispatch_q_.empty()) {
-      bool quota_reached = ProcessControlMessages(async_dispatch_quota);
-
-      GetQueueBackpressure().pubsub_ec.notifyAll();
-
-      // We explicitly `continue` back to the top of the loop for two reasons:
-      // 1. Fresh Data: Processing dispatch_q_ takes time. Jumping to the top forces
-      //    ReadPendingInput() to pull any newly arrived TCP data from the OS buffer.
-      //    Falling through skips ReadPendingInput(), so the data path checks io_buf_.InputLen()
-      //    before new socket data is read - potentially missing an entire parse cycle.
-      // 2. Low Latency: PubSub replies have accumulated in reply_builder_. The idle-await
-      //    block at the top is where we naturally Flush() and sleep. `continue` acts as a
-      //    fast-path to push these replies to the network immediately, skipping dead code.
-      //
-      // Starvation prevention: We only fall through if we hit our processing quota.
-      // This ensures a continuous flood of PubSub messages cannot indefinitely starve
-      // the data path (pipelined commands).
-      if (!quota_reached) {
-        continue;
-      }
+    // Control path: drain dispatch_q_. Restart the loop (so fresh socket data is read first) unless
+    // we hit the quota, in which case fall through to the data path to avoid starving it.
+    if (DrainControlPath(async_dispatch_quota)) {
+      continue;
     }
 
-    // Handle Parsed Commands Queue (Data Path)
-    auto& conn_stats = GetLocalConnStats();
-
-    // Only parse data if we are under the memory limit (backpressure).
-    // Exception: If the queue is empty, we always parse to allow admin commands
-    // (like CONFIG SET) to run so they can fix the memory limits if needed.
-    if ((io_buf_.InputLen() > 0) && !IsOverPipelineLimit()) {
-      // Data Normal Path: we have input data AND memory budget - parse new commands, execute,
-      // reply.
-      size_t mem_before = conn_stats.pipeline_queue_bytes;
-      parse_status = ParseLoop();
-      NotifyIfMemReleased(mem_before);
-    } else {
-      // Data Backpressure Path: either no input (io_buf_ empty) or over memory limit.
-      // Do NOT parse - that would grow the queue further. Instead, drain already-queued
-      // commands (execute + reply) to free memory, then park until pressure is relieved.
-      parse_status = NEED_MORE;
-
-      size_t mem_before = conn_stats.pipeline_queue_bytes;
-
-      if (parsed_head_) {
-        if (HasCommandToExecute())
-          ExecuteBatch();
-        ReplyBatch();
-      }
-
-      NotifyIfMemReleased(mem_before);
-
-      // await block (backpressure)
-      // Re-check if pipeline buffer over limit after draining - ExecuteBatch/ReplyBatch may have
-      // freed memory. If still over limit, sleep to prevent busy-spin.
-      // Only park if this connection is actively contributing (parsed_cmd_q_len_ > 0).
-      // Connections with an empty queue must stay in the read loop.
-      if (IsOverPipelineLimit()) {
-        conn_stats.pipeline_throttle_count++;
-        LOG_EVERY_T(WARNING, 10)
-            << "Pipeline buffer over limit (V2)."
-            << ", Thread pipeline_queue_bytes: " << conn_stats.pipeline_queue_bytes
-            << ", Thread pipeline_queue_entries: " << conn_stats.pipeline_queue_entries
-            << ", Connection parsed_cmd_q_bytes_: " << parsed_cmd_q_bytes_
-            << ", Connection parsed commands queue size: " << parsed_cmd_q_len_
-            << ", consider increasing pipeline_buffer_limit/pipeline_queue_limit";
-
-        // Subscribe persistently to the global backpressure EventCount so that when another
-        // connection frees memory (or CONFIG SET raises limits), our backpressure_waiter callback
-        // fires io_event_.notify(), waking this fiber. Must be persistent because
-        // io_event_.await()'s internal loop may re-sleep if the predicate is still false after the
-        // first notification. A one-shot subscription would be consumed on the first wake, leaving
-        // us "deaf" to future memory relief.
-        auto sub_key = GetQueueBackpressure().v2_pipeline_backpressure_ec.subscribe_persistent(
-            &backpressure_waiter);
-
-        // Client needs replies to free its send buffer and relieve backpressure.
-        if (auto ec = FlushReplies(); ec) {
-          return ec;
-        }
-
-        io_event_.await([this]() {
-          // Leave the backpressure wait once our own pipeline pressure clears, or on any shared
-          // unpark condition (the latter lets a terminating/migrating connection escape the park).
-          bool under_limit = !GetQueueBackpressure().IsPipelineBufferOverLimit(
-              GetLocalConnStats().pipeline_queue_bytes, parsed_cmd_q_len_);
-          return under_limit || ShouldUnpark();
-        });
-      }
-    }  // else Execute and reply
+    // Data path: parse when we have input and memory budget (admin commands always parse so they
+    // can relieve backpressure), otherwise drain queued commands and park on backpressure.
+    parse_status = (io_buf_.InputLen() > 0 && !IsOverPipelineLimit())
+                       ? RunParsePath()
+                       : RunBackpressurePath(&backpressure_waiter);
 
     if (reply_builder_->GetError()) {
       return reply_builder_->GetError();
