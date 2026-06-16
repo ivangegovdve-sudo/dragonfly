@@ -809,9 +809,7 @@ void Connection::OnPostMigrateThread() {
     MaybeEnableRecvMultishot();
     socket_->RegisterOnRecv([this](const FiberSocketBase::RecvNotification& n) {
       NotifyOnRecv(n);
-      if (pending_input_) {
-        ReadPendingInput();
-      }
+      ReadPendingInput();
       io_event_.notify();
     });
   }
@@ -2656,7 +2654,7 @@ bool Connection::ExecuteBatch() {
     // cannot read while executing. pending_input_ acts as a guard: if set, the kernel has
     // notified us that data is available, so drain it now. The drain clears pending_input_
     // (via EAGAIN), so subsequent iterations skip this until the next notification arrives.
-    if (ioloop_v2_ && pending_input_) {
+    if (ioloop_v2_) {
       ReadPendingInput();
     }
   }
@@ -2908,6 +2906,8 @@ void Connection::NotifyOnRecv(const util::FiberSocketBase::RecvNotification& n) 
 }
 
 void Connection::ReadPendingInput() {
+  if (!pending_input_)
+    return;
   // Drain available socket data into io_buf_.
   io::MutableBytes buf = io_buf_.AppendBuffer();
   // A recv call can return fewer bytes than requested even if the
@@ -3009,9 +3009,7 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
     // Eagerly drain the kernel TCP receive buffer while the connection fiber might be is
     // blocked/busy. This prevents rbuf starvation (V2's single fiber can't read while executing).
     // Safe: callback only fires when the fiber has yielded - no concurrent access to io_buf_.
-    if (pending_input_) {
-      ReadPendingInput();
-    }
+    ReadPendingInput();
     io_event_.notify();
   });
 
@@ -3041,9 +3039,7 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
       current_wait_.emplace(parsed_head_, &cmd_completion_waiter);
     }
 
-    if (pending_input_) {
-      ReadPendingInput();
-    }
+    ReadPendingInput();
 
     // await block (no data to read)
     if (io_buf_.InputLen() == 0) {
