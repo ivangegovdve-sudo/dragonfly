@@ -130,6 +130,9 @@ ABSL_FLAG(bool, enable_memcache_io_loop_v2, true,
           "Enable the event-driven IoLoopV2 for non-TLS Memcache connections.");
 ABSL_FLAG(bool, enable_resp_io_loop_v2, false,
           "Enable the event-driven IoLoopV2 for non-TLS RESP connections.");
+ABSL_FLAG(bool, enable_pipeline_squashing_v2, true,
+          "Enable vectorized pipeline squashing for the V2 dispatch loop. Groups consecutive "
+          "single-shard pipeline commands by shard and executes them in parallel.");
 ABSL_RETIRED_FLAG(bool, experimental_io_loop_v2, true, "retired.");
 
 using namespace util;
@@ -519,6 +522,8 @@ ConnectionStats& __attribute__((noinline)) GetLocalConnStats() {
 thread_local uint32_t max_busy_read_cycles_cached = UINT32_MAX;
 thread_local bool always_flush_pipeline_cached = absl::GetFlag(FLAGS_always_flush_pipeline);
 thread_local uint32_t pipeline_squash_limit_cached = absl::GetFlag(FLAGS_pipeline_squash_limit);
+
+constexpr unsigned kV2PipelineAccumulationYields = 2;
 
 }  // namespace
 
@@ -970,6 +975,7 @@ void Connection::HandleRequests() {
           !is_tls_ &&
           ((protocol_ == Protocol::MEMCACHE && GetFlag(FLAGS_enable_memcache_io_loop_v2)) ||
            (protocol_ == Protocol::REDIS && GetFlag(FLAGS_enable_resp_io_loop_v2)));
+      pipeline_squashing_v2_ = ioloop_v2_ && GetFlag(FLAGS_enable_pipeline_squashing_v2);
 
       socket_->RegisterOnErrorCb([this](int32_t mask) { this->OnBreakCb(mask); });
       switch (protocol_) {
@@ -1497,6 +1503,56 @@ auto Connection::ParseLoop() -> ParserStatus {
       protocol_ == Protocol::MEMCACHE ? &Connection::ParseMCBatch : &Connection::ParseRedisBatch;
 
   bool commands_parsed = false;
+  if (ioloop_v2_ && pipeline_squashing_v2_ && protocol_ == Protocol::REDIS) {
+    auto parse_available = [&]() {
+      while (io_buf_.InputLen() > 0) {
+        bool parsed = (this->*parse_func)(io_buf_);
+        commands_parsed |= parsed;
+        if (!parsed)
+          return;
+      }
+    };
+
+    parse_available();
+
+    // Once a pipeline is forming (more than one command waiting), briefly yield (or sleep, if
+    // pipeline_wait_batch_usec is set) so more socket input can be parsed into the same squash
+    // batch. A lone command (dispatch_waiting_count_ == 1) skips this entirely and dispatches
+    // immediately, so request-response traffic pays no extra latency. The loop also stops as soon
+    // as a yield brings in no new commands.
+    for (unsigned i = 0; i < kV2PipelineAccumulationYields && dispatch_waiting_count_ > 1 &&
+                         !reply_builder_->GetError();
+         ++i) {
+      if (pipeline_wait_batch_usec > 0) {
+        ThisFiber::SleepFor(chrono::microseconds(pipeline_wait_batch_usec));
+      } else {
+        ThisFiber::Yield();
+      }
+
+      size_t before = dispatch_waiting_count_;
+      ReadPendingInput();
+
+      // ReadPendingInput records hard socket errors in io_ec_ (EAGAIN is not an error). Stop
+      // accumulating and let ExecuteBatch/ReplyBatch drain what we have; IoLoopV2 observes io_ec_
+      // on the next iteration and tears the connection down.
+      if (io_ec_)
+        break;
+
+      parse_available();
+
+      if (dispatch_waiting_count_ == before)
+        break;
+    }
+
+    if (!ExecuteBatch())
+      return ERROR;
+
+    if (!ReplyBatch())
+      return ERROR;
+
+    return commands_parsed ? OK : NEED_MORE;
+  }
+
   do {
     commands_parsed = (this->*parse_func)(io_buf_);
 
@@ -1774,6 +1830,8 @@ void Connection::SquashPipeline() {
     ReleasePipelinedCommand(current);
     AdvanceParsedHead(next);
   }
+  DCHECK_GE(dispatch_waiting_count_, squashed);
+  dispatch_waiting_count_ -= squashed;  // the squashed run was waiting; it is now fully handled
   parsed_to_execute_ = parsed_head_;
 
   local_stats_.cmds += squashed;
@@ -1832,6 +1890,7 @@ void Connection::ClearPipelinedMessages() {
   DCHECK_EQ(parsed_cmd_q_bytes_, 0u);
   parsed_tail_ = nullptr;
   parsed_to_execute_ = nullptr;
+  dispatch_waiting_count_ = 0;
 
   QueueBackpressure& qbp = GetQueueBackpressure();
   qbp.NotifyPipelineWaiters();
@@ -1906,8 +1965,7 @@ bool Connection::ProcessAdminMessage(MessageHandle* msg, AsyncOperations* async_
 void Connection::ProcessPipelineCommandV1() {
   DCHECK(parsed_head_ && parsed_to_execute_) << DebugInfo();
   auto* cmd = parsed_to_execute_;
-  parsed_to_execute_ = cmd->next;
-  AdvanceParsedHead(parsed_to_execute_);
+  AdvanceParsedHead(AdvanceToExecute());
 
   tl_facade_stats->conn_stats.pipelined_wait_latency +=
       CycleClock::ToUsec(CycleClock::Now() - cmd->parsed_cycle);
@@ -2581,8 +2639,11 @@ bool Connection::ExecuteBatch() {
 
   bool is_true_pipeline = (parsed_to_execute_->next) != nullptr;
 
+  // Only called from the sequential loop below when cmd == parsed_head_ == parsed_to_execute_, so
+  // advancing the head also consumes one not-yet-dispatched command.
   auto advance_head = [&] {
     auto* cmd = parsed_head_;
+    AdvanceToExecute();  // cmd == parsed_to_execute_ here, so head and to-execute move together
     AdvanceParsedHead(parsed_head_->next);
     if (is_true_pipeline)  // pipeline mode as we have
       ReleasePipelinedCommand(cmd);
@@ -2590,6 +2651,30 @@ bool Connection::ExecuteBatch() {
       ReleaseParsedCommand(cmd);
     return parsed_head_;
   };
+
+  // V2 vectorized squash phase: group single-shard commands by shard and execute in parallel.
+  // dispatch_waiting_count_ is the exact length of the run starting at parsed_to_execute_, so the
+  // squash works even when earlier commands are still in flight (their deferred replies keep parse
+  // order; ReplyBatch won't send the squashed replies until the in-flight head completes).
+  if (pipeline_squashing_v2_ && dispatch_waiting_count_ > 1 && protocol_ == Protocol::REDIS) {
+    // Like V1's SquashPipeline, sample once before the blocking squash and attribute it to every
+    // squashed command's parse->dispatch wait.
+    uint64_t dispatch_start = CycleClock::Now();
+    unsigned squashed =
+        service_->DispatchSquashedBatch(parsed_to_execute_, dispatch_waiting_count_, cc_.get());
+    for (unsigned i = 0; i < squashed && parsed_to_execute_; i++) {
+      conn_stats.pipelined_wait_latency +=
+          CycleClock::ToUsec(dispatch_start - parsed_to_execute_->parsed_cycle);
+      AdvanceToExecute();
+    }
+    if (squashed > 0)
+      conn_stats.pipeline_dispatch_calls++;
+    conn_stats.pipeline_dispatch_commands += squashed;
+    if (squashed > 0) {
+      io_event_.notify();
+      return true;
+    }
+  }
 
   // Execute sequentially all parsed commands.
   for (auto& cmd = parsed_to_execute_; cmd != nullptr;) {
@@ -2603,7 +2688,7 @@ bool Connection::ExecuteBatch() {
         cmd->SendReply();
         cmd = advance_head();
       } else {
-        cmd = cmd->next;
+        cmd = AdvanceToExecute();
       }
       continue;
     }
@@ -2619,6 +2704,7 @@ bool Connection::ExecuteBatch() {
     // sendmsg syscalls to a minimum. IoLoopV2's idle-await block handles the final flush.
     reply_builder_->SetBatchMode(ioloop_v2_ && is_head && (cmd->next != nullptr));
 
+    uint64_t dispatch_start = CycleClock::Now();
     auto dispatch_res = service_->DispatchCommandSimple(cmd, mode);
 
     // Enforce the pipeline reply-ordering invariant: replies must reach the socket in parse order.
@@ -2638,12 +2724,13 @@ bool Connection::ExecuteBatch() {
     if (dispatch_res == DispatchResult::WOULD_BLOCK)
       break;  // Sync command. Wait for current async commands to finish
 
+    conn_stats.pipelined_wait_latency += CycleClock::ToUsec(dispatch_start - cmd->parsed_cycle);
     conn_stats.pipeline_dispatch_commands++;
     if (is_head)
       conn_stats.pipeline_dispatch_calls++;
 
     if (cmd->IsDeferredReply()) {
-      cmd = cmd->next;
+      cmd = AdvanceToExecute();
     } else {
       DCHECK(is_head);       // only head can execute sync
       cmd = advance_head();  // advance it
@@ -2725,6 +2812,7 @@ void Connection::EnqueueParsedCommand(ParsedCommand* cmd) {
 
   size_t used_mem = cmd->EnqueuedBytes();
   parsed_cmd_q_len_++;
+  dispatch_waiting_count_++;  // the newly appended tail command is not yet dispatched
   parsed_cmd_q_bytes_ += used_mem;
   local_stats_.dispatch_entries_added++;
   conn_stats.pipeline_queue_entries++;
@@ -2797,6 +2885,8 @@ void Connection::DestroyParsedQueue() {
   }
 
   parsed_tail_ = nullptr;
+  parsed_to_execute_ = nullptr;
+  dispatch_waiting_count_ = 0;
   CHECK_EQ(parsed_cmd_q_len_, 0u);
   CHECK_EQ(parsed_cmd_q_bytes_, 0u);
   delete parsed_cmd_;
@@ -3014,6 +3104,16 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
   // to global pipeline-backpressure relief notifications.
   util::fb2::detail::Waiter backpressure_waiter{ioevent_cb};
 
+  auto flush_pipeline_replies = [this]() -> error_code {
+    auto& conn_stats = GetLocalConnStats();
+    uint64_t flush_start_cycle = CycleClock::Now();
+    reply_builder_->Flush();
+    conn_stats.pipeline_dispatch_flush_count++;
+    conn_stats.pipeline_dispatch_flush_usec +=
+        CycleClock::ToUsec(CycleClock::Now() - flush_start_cycle);
+    return reply_builder_->GetError();
+  };
+
   const uint32_t async_dispatch_quota = GetFlag(FLAGS_async_dispatch_quota);
 
   do {
@@ -3056,11 +3156,9 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
 
         // Flush replies deferred by ReplyBatch before sleeping - ensures the client
         // gets its response even when no more data arrives (single commands, end of pipeline).
-        reply_builder_->Flush();
-        if (auto err = reply_builder_->GetError(); err) {
+        if (auto err = flush_pipeline_replies(); err) {
           return err;
         }
-
         io_event_.await(should_wake);
       }
     }
@@ -3162,10 +3260,8 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
         // first notification. A one-shot subscription would be consumed on the first wake, leaving
         // us "deaf" to future memory relief.
         auto sub_key = qbp.v2_pipeline_backpressure_ec.subscribe_persistent(&backpressure_waiter);
-
         // Client needs replies to free its send buffer and relieve backpressure.
-        reply_builder_->Flush();
-        if (auto err = reply_builder_->GetError(); err) {
+        if (auto err = flush_pipeline_replies(); err) {
           return err;
         }
 
