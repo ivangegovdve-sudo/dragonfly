@@ -939,6 +939,9 @@ void Connection::OnPostMigrateThread() {
     MaybeEnableRecvMultishot();
     socket_->RegisterOnRecv([this](const FiberSocketBase::RecvNotification& n) {
       NotifyOnRecv(n);
+      if (pending_input_) {
+        ReadPendingInput();
+      }
       io_event_.notify();
     });
   }
@@ -2794,6 +2797,14 @@ bool Connection::ExecuteBatch() {
       DCHECK(is_head);       // only head can execute sync
       cmd = advance_head();  // advance it
     }
+
+    // Drain pending socket data mid-batch. In V2's single-fiber architecture, the fiber
+    // cannot read while executing. pending_input_ acts as a guard: if set, the kernel has
+    // notified us that data is available, so drain it now. The drain clears pending_input_
+    // (via EAGAIN), so subsequent iterations skip this until the next notification arrives.
+    if (ioloop_v2_ && pending_input_) {
+      ReadPendingInput();
+    }
   }
 
   if (parsed_head_ == nullptr)
@@ -3151,6 +3162,12 @@ variant<error_code, Connection::ParserStatus> Connection::IoLoopV2() {
   peer->RegisterOnRecv([this](const FiberSocketBase::RecvNotification& n) {
     DVLOG(2) << "Calling DoReadOnRecv iobuf_len: " << io_buf_.InputLen();
     NotifyOnRecv(n);
+    // Eagerly drain the kernel TCP receive buffer while the connection fiber might be is
+    // blocked/busy. This prevents rbuf starvation (V2's single fiber can't read while executing).
+    // Safe: callback only fires when the fiber has yielded - no concurrent access to io_buf_.
+    if (pending_input_) {
+      ReadPendingInput();
+    }
     // Capture notify TSC for wake-latency measurement. Runs in proactor
     // callback context on this connection's owning thread, so the plain-store is
     // safe (no other fiber/thread touches last_notify_tsc_).
