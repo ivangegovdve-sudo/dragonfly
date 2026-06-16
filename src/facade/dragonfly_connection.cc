@@ -1502,12 +1502,13 @@ auto Connection::ParseLoop() -> ParserStatus {
   auto parse_func =
       protocol_ == Protocol::MEMCACHE ? &Connection::ParseMCBatch : &Connection::ParseRedisBatch;
 
-  bool commands_parsed = false;
+  bool has_parsed_command = false;
+#if 0
   if (ioloop_v2_ && pipeline_squashing_v2_ && protocol_ == Protocol::REDIS) {
     auto parse_available = [&]() {
       while (io_buf_.InputLen() > 0) {
         bool parsed = (this->*parse_func)(io_buf_);
-        commands_parsed |= parsed;
+        has_parsed_command |= parsed;
         if (!parsed)
           return;
       }
@@ -1550,20 +1551,23 @@ auto Connection::ParseLoop() -> ParserStatus {
     if (!ReplyBatch())
       return ERROR;
 
-    return commands_parsed ? OK : NEED_MORE;
+    return has_parsed_command ? OK : NEED_MORE;
   }
+#endif
 
   do {
-    commands_parsed = (this->*parse_func)(io_buf_);
+    DCHECK_GT(io_buf_.InputLen(), 0u);
+
+    has_parsed_command = (this->*parse_func)(io_buf_);
 
     if (!ExecuteBatch())
       return ERROR;
 
     if (!ReplyBatch())
       return ERROR;
-  } while (commands_parsed && io_buf_.InputLen() > 0);
+  } while (has_parsed_command && io_buf_.InputLen() > 0);
 
-  return commands_parsed ? OK : NEED_MORE;
+  return has_parsed_command ? OK : NEED_MORE;
 }
 
 void Connection::OnBreakCb(int32_t mask) {
@@ -2629,6 +2633,7 @@ bool Connection::ExecuteBatch() {
   // Invariant: batched_ must be false on entry.
   // Both ReplyBatch() and ExecuteBatch() reset it via absl::Cleanup guards on all return paths.
   DCHECK(!reply_builder_->IsBatchMode());
+  DCHECK(!pending_input_);
 
   if (parsed_to_execute_ == nullptr) {
     return true;  // no errors.
